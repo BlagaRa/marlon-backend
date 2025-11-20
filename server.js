@@ -44,7 +44,6 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
 
     const resrc = payload?.payload?.resource || {};
     const output = resrc?.output || {};
-    
     const runId = resrc?.workflow_run_id || resrc?.id || payload?.payload?.object?.id || null;
 
     if (runId) {
@@ -64,7 +63,7 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
         result: result,
         breakdown: breakdown,
         full_name: output?.full_name || existing.full_name,
-        raw_output: { ...existing.raw_output, ...output },
+        raw_output: { ...existing.raw_output, ...output }, 
         received_at: new Date().toISOString(),
       };
 
@@ -109,13 +108,7 @@ async function onfidoFetch(pathname, opts = {}) {
 app.post("/api/applicants", async (req, res) => {
   try {
     const { first_name, last_name, email } = req.body || {};
-
-    const payload = {
-      first_name,
-      last_name,
-      email
-    };
-
+    const payload = { first_name, last_name, email };
     const applicant = await onfidoFetch(`/applicants`, {
       method: "POST",
       body: JSON.stringify(payload),
@@ -145,12 +138,9 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
       method: "GET",
     });
 
-    const status = run?.status || null;
     const output = run?.output || {};
-
     let first_name = output?.first_name ?? null;
     let last_name = output?.last_name ?? null;
-    let full_name = output?.full_name ?? null;
     
     if ((!first_name || !last_name) && run?.applicant_id) {
       try {
@@ -163,13 +153,11 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
       } catch (e) {}
     }
 
-    full_name = full_name || [first_name, last_name].filter(Boolean).join(" ") || null;
+    const full_name = [first_name, last_name].filter(Boolean).join(" ") || null;
 
     res.json({
-      workflow_run_id: run?.id || runId,
-      status,
+      ...run,
       full_name,
-      dashboard_url: run?.dashboard_url || null,
     });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, details: e.payload });
