@@ -47,14 +47,32 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
     const runId = resrc?.workflow_run_id || resrc?.id || payload?.payload?.object?.id || null;
 
     if (runId) {
-      const existing = webhookStore.get(runId) || {};
+      const existing = webhookStore.get(runId) || { raw_output: {} };
       
+      // SMART MERGE: We assume 'output' contains the data fields (address, gender, etc)
+      // We merge the new output into the existing output so we don't lose fields from previous webhooks.
+      const mergedOutput = { ...existing.raw_output };
+
+      // If the new output has keys, add them. If a key is null in new output, keep the old one.
+      if (output && typeof output === 'object' && !Array.isArray(output)) {
+          Object.keys(output).forEach(key => {
+              if (output[key] !== null && output[key] !== undefined) {
+                  mergedOutput[key] = output[key];
+              }
+          });
+      }
+
+      // Update status only if the new one is more "final" or if we don't have one
+      let status = existing.status;
+      if (resrc.status && resrc.status !== "processing") {
+          status = resrc.status; // Capture Approved/Review/Declined
+      } else if (!status) {
+          status = resrc.status;
+      }
+
+      // Capture breakdown if present, don't overwrite with null
       const breakdown = output?.breakdown || existing.breakdown || null;
       const result = output?.result || existing.result || null;
-      
-      const status = (resrc.resource_type === "workflow_run") 
-        ? (resrc.status || existing.status) 
-        : existing.status;
 
       const merged = {
         ...existing,
@@ -62,8 +80,9 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
         status: status,
         result: result,
         breakdown: breakdown,
-        full_name: output?.full_name || existing.full_name,
-        raw_output: { ...existing.raw_output, ...output }, 
+        // Prioritize full_name from output, fallback to existing
+        full_name: output?.full_name || existing.full_name, 
+        raw_output: mergedOutput, 
         received_at: new Date().toISOString(),
       };
 
@@ -72,6 +91,7 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
 
     res.status(200).send("ok");
   } catch (err) {
+    console.error("Webhook error", err);
     res.status(200).send("ok");
   }
 });
@@ -134,11 +154,21 @@ app.post("/api/workflow_runs", async (req, res) => {
 app.get("/api/workflow_runs/:id", async (req, res) => {
   try {
     const runId = req.params.id;
+    
+    // 1. Get fresh data from Onfido API
     const run = await onfidoFetch(`/workflow_runs/${encodeURIComponent(runId)}`, {
       method: "GET",
     });
 
-    const output = run?.output || {};
+    // 2. Check if we have richer data in our Webhook Store (sometimes webhook has data before GET api)
+    const webhookData = webhookStore.get(runId);
+    
+    // Merge the API output with our accumulated webhook output
+    const output = { 
+        ...(run?.output || {}), 
+        ...(webhookData?.raw_output || {}) 
+    };
+
     let first_name = output?.first_name ?? null;
     let last_name = output?.last_name ?? null;
     
@@ -157,7 +187,9 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
 
     res.json({
       ...run,
+      output, // Send the merged output
       full_name,
+      status: run.status // API status is authority
     });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, details: e.payload });
