@@ -1,4 +1,3 @@
-// server.mjs
 import express from "express";
 import dotenv from "dotenv";
 import path from "path";
@@ -17,11 +16,9 @@ const ONFIDO_API_BASE = process.env.ONFIDO_API_BASE || "https://api.us.onfido.co
 const ONFIDO_API_VERSION = "v3.6";
 
 if (!ONFIDO_API_TOKEN) {
-  console.error("❌ Lipsă ONFIDO_API_TOKEN în .env");
   process.exit(1);
 }
 
-/* CORS larg pentru testare publică, fără cookies */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -31,10 +28,8 @@ app.use((req, res, next) => {
   next();
 });
 
-/* Health */
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-/* Webhook: citim RAW înainte de JSON parser */
 const webhookStore = new Map();
 
 app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, res) => {
@@ -44,42 +39,40 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
     try {
       payload = JSON.parse(raw.toString("utf8"));
     } catch {
-      console.warn("⚠️ Webhook JSON invalid");
       return res.status(200).send("ok");
     }
 
     const resrc = payload?.payload?.resource || {};
     const output = resrc?.output || {};
-    const runId =
-      resrc?.id || payload?.payload?.object?.id || payload?.object?.id || null;
-
-    const mapped = {
-      workflow_run_id: runId,
-      status: resrc?.status || payload?.payload?.object?.status || null,
-      first_name: output?.first_name ?? null,
-      last_name: output?.last_name ?? null,
-      full_name: output?.full_name ?? null,
-      gender: output?.gender ?? null,
-      dob: output?.dob ?? null,
-      document_type: output?.document_type ?? null,
-      document_number: output?.document_number ?? null,
-      date_expiry: output?.date_expiry ?? null,
-      address: output?.address ?? null, // poate fi obiect sau string
-      applicant_id: resrc?.applicant_id || null,
-      received_at: new Date().toISOString(),
-    };
+    
+    const runId = resrc?.workflow_run_id || resrc?.id || payload?.payload?.object?.id || null;
 
     if (runId) {
-      webhookStore.set(runId, { ...mapped, raw_output: output, raw_payload: payload });
-      console.log("✅ Webhook primit:", runId, "status:", mapped.status);
-      console.log("ℹ️ Webhook output:", JSON.stringify(output, null, 2));
-    } else {
-      console.log("⚠️ Webhook fără run id");
+      const existing = webhookStore.get(runId) || {};
+      
+      const breakdown = output?.breakdown || existing.breakdown || null;
+      const result = output?.result || existing.result || null;
+      
+      const status = (resrc.resource_type === "workflow_run") 
+        ? (resrc.status || existing.status) 
+        : existing.status;
+
+      const merged = {
+        ...existing,
+        workflow_run_id: runId,
+        status: status,
+        result: result,
+        breakdown: breakdown,
+        full_name: output?.full_name || existing.full_name,
+        raw_output: { ...existing.raw_output, ...output },
+        received_at: new Date().toISOString(),
+      };
+
+      webhookStore.set(runId, merged);
     }
 
     res.status(200).send("ok");
   } catch (err) {
-    console.error("❌ Eroare webhook:", err);
     res.status(200).send("ok");
   }
 });
@@ -90,7 +83,6 @@ app.get("/api/webhook_runs/:id", (req, res) => {
   res.json(data);
 });
 
-/* JSON parser după webhook */
 app.use(express.json({ limit: "2mb" }));
 
 async function onfidoFetch(pathname, opts = {}) {
@@ -114,72 +106,14 @@ async function onfidoFetch(pathname, opts = {}) {
   return json;
 }
 
-/* Utils pentru adresă: formatăm orice variantă în string prietenos */
-function formatAddressGeneric(addr) {
-  if (!addr) return null;
-  if (typeof addr === "string") return addr;
-  const parts = [
-    addr.flat_number,
-    addr.building_number,
-    addr.building_name,
-    addr.line1 || addr.street,
-    addr.line2,
-    addr.line3,
-    addr.town,
-    addr.state,
-    addr.postcode,
-    addr.country,
-  ].filter(Boolean);
-  return parts.join(", ");
-}
-
-/* Create applicant — primește câmpuri simple și construiește address corect */
 app.post("/api/applicants", async (req, res) => {
   try {
-    const {
-      first_name,
-      last_name,
-      email,
-      country, // ISO3
-      town,    // city
-      address, // single line goes to line1
-      state,
-      postcode,
-    } = req.body || {};
-
-    const ctry = (country || "").toUpperCase().trim();
-    const city = (town || "").trim();
-    const line1 = (address || "").trim();
-    let st = (state || "").trim();
-
-    // ✅ for USA enforce 2-letter USPS
-    if (ctry === "USA") {
-      st = st.toUpperCase().slice(0, 2);
-      if (!/^[A-Z]{2}$/.test(st)) {
-        return res.status(400).json({ error: "State is required for US addresses (two-letter USPS code)." });
-      }
-    } else {
-      st = st || undefined; // optional elsewhere
-    }
-
-    let addressPayload = null;
-    const pc = (postcode || "").trim();
-
-    if (ctry.length === 3 && (city || line1)) {
-      addressPayload = {
-        country: ctry,
-        town: city || undefined,
-        line1: line1 || undefined,
-        state: st || undefined,
-        postcode: pc || undefined,
-      };
-    }
+    const { first_name, last_name, email } = req.body || {};
 
     const payload = {
       first_name,
       last_name,
-      email,
-      ...(addressPayload ? { address: addressPayload } : {}),
+      email
     };
 
     const applicant = await onfidoFetch(`/applicants`, {
@@ -192,7 +126,6 @@ app.post("/api/applicants", async (req, res) => {
   }
 });
 
-/* Pornește workflow */
 app.post("/api/workflow_runs", async (req, res) => {
   try {
     const run = await onfidoFetch(`/workflow_runs`, {
@@ -205,20 +138,6 @@ app.post("/api/workflow_runs", async (req, res) => {
   }
 });
 
-/* Citește applicant (fallback util) */
-app.get("/api/applicants/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const applicant = await onfidoFetch(`/applicants/${encodeURIComponent(id)}`, {
-      method: "GET",
-    });
-    res.json(applicant);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message, details: e.payload });
-  }
-});
-
-/* Get workflow run + fallback pe applicant + adresă formatată */
 app.get("/api/workflow_runs/:id", async (req, res) => {
   try {
     const runId = req.params.id;
@@ -232,16 +151,8 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
     let first_name = output?.first_name ?? null;
     let last_name = output?.last_name ?? null;
     let full_name = output?.full_name ?? null;
-    let gender = output?.gender ?? null;
-    let dob = output?.dob ?? null;
-    let document_type = output?.document_type ?? null;
-    let document_number = output?.document_number ?? null;
-    let date_expiry = output?.date_expiry ?? null;
-
-    let address_obj = typeof output?.address === "object" ? output.address : null;
-    let address_str = typeof output?.address === "string" ? output.address : null;
-
-    if ((!first_name || !last_name || (!address_obj && !address_str)) && run?.applicant_id) {
+    
+    if ((!first_name || !last_name) && run?.applicant_id) {
       try {
         const applicant = await onfidoFetch(
           `/applicants/${encodeURIComponent(run.applicant_id)}`,
@@ -249,35 +160,15 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
         );
         first_name = first_name || applicant?.first_name || null;
         last_name = last_name || applicant?.last_name || null;
-        if (!full_name && (first_name || last_name)) {
-          full_name = [first_name, last_name].filter(Boolean).join(" ") || null;
-        }
-        if (!address_obj && !address_str && applicant?.address) {
-          if (typeof applicant.address === "string") address_str = applicant.address;
-          else address_obj = applicant.address;
-        }
-      } catch (e) {
-        console.warn("⚠️ Applicant fallback failed:", e?.message || e);
-      }
+      } catch (e) {}
     }
 
-    const address_formatted =
-      address_str || formatAddressGeneric(address_obj) || null;
+    full_name = full_name || [first_name, last_name].filter(Boolean).join(" ") || null;
 
     res.json({
       workflow_run_id: run?.id || runId,
       status,
-      applicant_id: run?.applicant_id || null,
-      document_type: document_type ?? null,
-      document_number: document_number ?? null,
-      dob: dob ?? null,
-      date_expiry: date_expiry ?? null,
-      gender: gender ?? null,
-      first_name: first_name ?? null,
-      last_name: last_name ?? null,
-      full_name: full_name || [first_name, last_name].filter(Boolean).join(" ") || null,
-      address: address_obj || address_str || null,
-      address_formatted,
+      full_name,
       dashboard_url: run?.dashboard_url || null,
     });
   } catch (e) {
@@ -286,5 +177,5 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server pornit pe http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
