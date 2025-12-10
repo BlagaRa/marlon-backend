@@ -32,6 +32,7 @@ app.get("/healthz", (_req, res) => res.send("ok"));
 
 const webhookStore = new Map();
 
+// UPDATED: Webhook handler to support workflow_task.completed structure
 app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ""), "utf8");
@@ -42,18 +43,20 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
       return res.status(200).send("ok");
     }
 
+    // Determine the type of webhook resource
     const resrc = payload?.payload?.resource || {};
+    // Logic for tasks: resource.output contains sub_result and properties
     const output = resrc?.output || {};
+    
+    // Find ID: could be workflow_run_id (inside task resource) or id (if it is a run)
     const runId = resrc?.workflow_run_id || resrc?.id || payload?.payload?.object?.id || null;
 
     if (runId) {
       const existing = webhookStore.get(runId) || { raw_output: {} };
       
-      // SMART MERGE: We assume 'output' contains the data fields (address, gender, etc)
-      // We merge the new output into the existing output so we don't lose fields from previous webhooks.
       const mergedOutput = { ...existing.raw_output };
 
-      // If the new output has keys, add them. If a key is null in new output, keep the old one.
+      // Flatten the output object into mergedOutput
       if (output && typeof output === 'object' && !Array.isArray(output)) {
           Object.keys(output).forEach(key => {
               if (output[key] !== null && output[key] !== undefined) {
@@ -62,17 +65,22 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
           });
       }
 
-      // Update status only if the new one is more "final" or if we don't have one
-      let status = existing.status;
-      if (resrc.status && resrc.status !== "processing") {
-          status = resrc.status; // Capture Approved/Review/Declined
-      } else if (!status) {
-          status = resrc.status;
+      // Handle properties specifically if they exist (common in tasks)
+      if (output.properties && typeof output.properties === 'object') {
+           Object.keys(output.properties).forEach(key => {
+              mergedOutput[key] = output.properties[key];
+           });
       }
 
-      // Capture breakdown if present, don't overwrite with null
+      let status = existing.status;
+      // If the resource itself has a status (like a run), use it
+      if (resrc.status && resrc.status !== "processing") {
+          status = resrc.status; 
+      }
+
       const breakdown = output?.breakdown || existing.breakdown || null;
-      const result = output?.result || existing.result || null;
+      // Use sub_result if available (from task), otherwise generic result
+      const result = output?.sub_result || output?.result || existing.result || null;
 
       const merged = {
         ...existing,
@@ -80,7 +88,6 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
         status: status,
         result: result,
         breakdown: breakdown,
-        // Prioritize full_name from output, fallback to existing
         full_name: output?.full_name || existing.full_name, 
         raw_output: mergedOutput, 
         received_at: new Date().toISOString(),
@@ -127,8 +134,10 @@ async function onfidoFetch(pathname, opts = {}) {
 
 app.post("/api/applicants", async (req, res) => {
   try {
-    const { first_name, last_name, email } = req.body || {};
-    const payload = { first_name, last_name, email };
+    // UPDATED: Accept phone_number
+    const { first_name, last_name, email, phone_number } = req.body || {};
+    const payload = { first_name, last_name, email, phone_number };
+    
     const applicant = await onfidoFetch(`/applicants`, {
       method: "POST",
       body: JSON.stringify(payload),
@@ -155,15 +164,13 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
   try {
     const runId = req.params.id;
     
-    // 1. Get fresh data from Onfido API
     const run = await onfidoFetch(`/workflow_runs/${encodeURIComponent(runId)}`, {
       method: "GET",
     });
 
-    // 2. Check if we have richer data in our Webhook Store (sometimes webhook has data before GET api)
     const webhookData = webhookStore.get(runId);
     
-    // Merge the API output with our accumulated webhook output
+    // Merge run output with webhook output
     const output = { 
         ...(run?.output || {}), 
         ...(webhookData?.raw_output || {}) 
@@ -172,6 +179,7 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
     let first_name = output?.first_name ?? null;
     let last_name = output?.last_name ?? null;
     
+    // If name is missing in output, try fetching applicant details
     if ((!first_name || !last_name) && run?.applicant_id) {
       try {
         const applicant = await onfidoFetch(
@@ -187,9 +195,9 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
 
     res.json({
       ...run,
-      output, // Send the merged output
+      output, 
       full_name,
-      status: run.status // API status is authority
+      status: run.status 
     });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message, details: e.payload });
