@@ -32,7 +32,6 @@ app.get("/healthz", (_req, res) => res.send("ok"));
 
 const webhookStore = new Map();
 
-// UPDATED: Webhook handler to support workflow_task.completed structure
 app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ""), "utf8");
@@ -43,65 +42,90 @@ app.post("/webhook/onfido", express.raw({ type: "*/*", limit: "5mb" }), (req, re
       return res.status(200).send("ok");
     }
 
-    // Determine the type of webhook resource
     const resrc = payload?.payload?.resource || {};
-    // Logic for tasks: resource.output contains sub_result and properties
     const output = resrc?.output || {};
-    
-    // Find ID: could be workflow_run_id (inside task resource) or id (if it is a run)
-    const runId = resrc?.workflow_run_id || resrc?.id || payload?.payload?.object?.id || null;
+    const obj = payload?.payload?.object || {};
 
-    if (runId) {
-      const existing = webhookStore.get(runId) || { raw_output: {} };
-      
-      const mergedOutput = { ...existing.raw_output };
+    // IMPORTANT: rulează pe același workflow_run_id
+    const runId =
+      resrc?.workflow_run_id ||
+      obj?.workflow_run_id ||
+      (payload?.payload?.resource_type === "workflow_run" ? resrc?.id : null) ||
+      null;
 
-      // Flatten the output object into mergedOutput
-      if (output && typeof output === 'object' && !Array.isArray(output)) {
-          Object.keys(output).forEach(key => {
-              if (output[key] !== null && output[key] !== undefined) {
-                  mergedOutput[key] = output[key];
-              }
-          });
+    if (!runId) return res.status(200).send("ok");
+
+    const existing = webhookStore.get(runId) || {
+      raw_output: {},
+      breakdowns: {},        // păstrează breakdown pe task
+      document_breakdown: null,
+      device_breakdown: null,
+    };
+
+    const mergedOutput = { ...existing.raw_output };
+
+    // salvează output "flat" (dar nu te baza pe asta pentru breakdown)
+    if (output && typeof output === "object" && !Array.isArray(output)) {
+      for (const k of Object.keys(output)) {
+        if (output[k] !== null && output[k] !== undefined) mergedOutput[k] = output[k];
       }
-
-      // Handle properties specifically if they exist (common in tasks)
-      if (output.properties && typeof output.properties === 'object') {
-           Object.keys(output.properties).forEach(key => {
-              mergedOutput[key] = output.properties[key];
-           });
-      }
-
-      let status = existing.status;
-      // If the resource itself has a status (like a run), use it
-      if (resrc.status && resrc.status !== "processing") {
-          status = resrc.status; 
-      }
-
-      const breakdown = output?.breakdown || existing.breakdown || null;
-      // Use sub_result if available (from task), otherwise generic result
-      const result = output?.sub_result || output?.result || existing.result || null;
-
-      const merged = {
-        ...existing,
-        workflow_run_id: runId,
-        status: status,
-        result: result,
-        breakdown: breakdown,
-        full_name: output?.full_name || existing.full_name, 
-        raw_output: mergedOutput, 
-        received_at: new Date().toISOString(),
-      };
-
-      webhookStore.set(runId, merged);
     }
 
-    res.status(200).send("ok");
+    // flatează properties
+    if (output?.properties && typeof output.properties === "object") {
+      for (const k of Object.keys(output.properties)) mergedOutput[k] = output.properties[k];
+    }
+
+    // task id, foarte util ca să nu suprascrii breakdown-ul greșit
+    const taskDefId = resrc?.task_def_id || obj?.task_def_id || null;
+
+    // păstrează breakdown pe task
+    if (taskDefId && output?.breakdown && typeof output.breakdown === "object") {
+      existing.breakdowns[taskDefId] = output.breakdown;
+
+      // salvează separat breakdown-ul de document (cel care are visual_authenticity)
+      if (output.breakdown.visual_authenticity) {
+        existing.document_breakdown = output.breakdown;
+      }
+
+      // salvează separat breakdown-ul de device (opțional)
+      if (output.breakdown.device) {
+        existing.device_breakdown = output.breakdown;
+      }
+    }
+
+    // status: la workflow_run vine în resrc.status, la task vine în obj.status ("completed")
+    let status = existing.status;
+    if (typeof resrc?.status === "string" && resrc.status !== "processing") status = resrc.status;
+
+    // result/sub_result
+    const result = output?.sub_result || output?.result || existing.result || null;
+
+    // IMPORTANT: breakdown principal să fie cel de document dacă există
+    const primaryBreakdown =
+      existing.document_breakdown ||
+      existing.breakdowns?.document_check_with_address_information ||
+      existing.breakdown ||
+      null;
+
+    const merged = {
+      ...existing,
+      workflow_run_id: runId,
+      status,
+      result,
+      breakdown: primaryBreakdown,
+      raw_output: mergedOutput,
+      received_at: new Date().toISOString(),
+    };
+
+    webhookStore.set(runId, merged);
+    return res.status(200).send("ok");
   } catch (err) {
     console.error("Webhook error", err);
-    res.status(200).send("ok");
+    return res.status(200).send("ok");
   }
 });
+
 
 app.get("/api/webhook_runs/:id", (req, res) => {
   const data = webhookStore.get(req.params.id);
@@ -134,7 +158,6 @@ async function onfidoFetch(pathname, opts = {}) {
 
 app.post("/api/applicants", async (req, res) => {
   try {
-    // UPDATED: Accept phone_number
     const { first_name, last_name, email, phone_number } = req.body || {};
     const payload = { first_name, last_name, email, phone_number };
     
@@ -170,7 +193,6 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
 
     const webhookData = webhookStore.get(runId);
     
-    // Merge run output with webhook output
     const output = { 
         ...(run?.output || {}), 
         ...(webhookData?.raw_output || {}) 
@@ -179,7 +201,6 @@ app.get("/api/workflow_runs/:id", async (req, res) => {
     let first_name = output?.first_name ?? null;
     let last_name = output?.last_name ?? null;
     
-    // If name is missing in output, try fetching applicant details
     if ((!first_name || !last_name) && run?.applicant_id) {
       try {
         const applicant = await onfidoFetch(
